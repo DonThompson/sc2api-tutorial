@@ -64,6 +64,20 @@ public:
     {
         return observation->GetUnits(Unit::Alliance::Self, IsUnit(unitTypeID));
     }
+
+    static Units Utils::GetIdleUnits(const ObservationInterface* observation, UNIT_TYPEID unitTypeID)
+    {
+        //TODO:  Need to find some info on Filter, this should be simpler.
+        Units allUnits = observation->GetUnits(Unit::Alliance::Self, IsUnit(unitTypeID));
+        Units idleUnits;
+        for (const Unit* unit : allUnits) {
+            if (unit->orders.size() == 0) {
+                idleUnits.push_back(unit);
+            }
+        }
+
+        return idleUnits;
+    }
 };
 
 class ManagerBase
@@ -110,9 +124,6 @@ protected:
 
 class SupplyManager : public ManagerBase
 {
-private:
-    Agent* bot;
-
 public:
     SupplyManager::SupplyManager()
     {
@@ -323,6 +334,25 @@ public:
         }
     }
 
+    virtual void OnUnitIdle(const Unit* unit)
+    {
+        switch (unit->unit_type.ToType()) {
+            case UNIT_TYPEID::TERRAN_COMMANDCENTER:     OnCommandCenterIdle(unit);      break;
+            case UNIT_TYPEID::TERRAN_SCV: {
+                const Unit* mineral_target = FindNearestMineralPatch(unit->pos);
+                if (mineral_target == nullptr) {
+                    break;
+                }
+                Actions()->UnitCommand(unit, ABILITY_ID::SMART, mineral_target);
+                break;
+            }
+            default: {
+                break;
+            }
+        }
+    }
+
+private:
     void EconManager::BalanceBuilders()
     {
         //Version 1:  SIMPLE.  If we have a refinery < max, assign there.  Otherwise, assign to minerals.
@@ -367,25 +397,6 @@ public:
         }
     }
 
-    virtual void OnUnitIdle(const Unit* unit)
-    {
-        switch (unit->unit_type.ToType()) {
-            case UNIT_TYPEID::TERRAN_COMMANDCENTER:     OnCommandCenterIdle(unit);      break;
-            case UNIT_TYPEID::TERRAN_SCV: {
-                const Unit* mineral_target = FindNearestMineralPatch(unit->pos);
-                if (mineral_target == nullptr) {
-                    break;
-                }
-                Actions()->UnitCommand(unit, ABILITY_ID::SMART, mineral_target);
-                break;
-            }
-            default: {
-                break;
-            }
-        }
-    }
-
-private:
     //Simple hardcoded
     bool EconManager::NeedRefinery()
     {
@@ -394,13 +405,13 @@ private:
 
         int32_t supplyUsed = observation->GetFoodUsed();
 
-        //Don't build the first until 15 supply.
-        if (supplyUsed >= 15 && GetRefineryCount() < 1) {
+        //Don't build the first until 18 supply.
+        if (supplyUsed >= 18 && GetRefineryCount() < 1) {
             return true;
         }
 
         //Build the second around 22
-        if (supplyUsed >= 20 && GetRefineryCount() < 2) {
+        if (supplyUsed >= 22 && GetRefineryCount() < 2) {
             return true;
         }
         
@@ -471,10 +482,100 @@ private:
 
 };
 
+class ArmyManager : public ManagerBase {
+public:
+    ArmyManager::ArmyManager()
+    {
+    }
+
+    ArmyManager::~ArmyManager()
+    {
+    }
+
+    virtual void ArmyManager::OnStep()
+    {
+        const ObservationInterface* observation = Observation();
+        ActionInterface* actions = Actions();
+
+        if (BarracksNeeded()) {
+            TryBuildBarracks();
+        }
+
+        //The whole strategy!
+        TryAttackInGroups();
+    }
+
+    bool ArmyManager::BarracksNeeded()
+    {
+        const ObservationInterface* observation = Observation();
+
+        int32_t countBarracks = Utils::CountOwnUnits(observation, UNIT_TYPEID::TERRAN_BARRACKS);
+
+        //Build our first barracks at 16 and build one every time we hit 600 minerals in the bank after that.  Max at 10.
+        if (countBarracks == 0 && observation->GetFoodUsed() > 16) {
+            return true;
+        }
+        else if (countBarracks < 10 && observation->GetMinerals() >= 600) {
+            return true;
+        }
+        else {
+            //That seems like enough barracks
+        }
+
+        return false;
+    }
+
+    bool ArmyManager::TryBuildBarracks()
+    {
+        return Utils::TryBuildStructure(Observation(), Actions(), ABILITY_ID::BUILD_BARRACKS);
+    }
+
+    void ArmyManager::TryAttackInGroups()
+    {
+        const ObservationInterface* observation = Observation();
+
+        Units idleMarines = Utils::GetIdleUnits(observation, UNIT_TYPEID::TERRAN_MARINE);
+        if (idleMarines.size() > 15) {
+            LaunchAttackGroup(idleMarines);
+        }
+    }
+
+    void ArmyManager::LaunchAttackGroup(Units unitsToAttack)
+    {
+        const GameInfo& gameInfo = Observation()->GetGameInfo();
+        //What is attack_attack vs attack?
+        Actions()->UnitCommand(unitsToAttack, ABILITY_ID::ATTACK_ATTACK, gameInfo.enemy_start_locations.front());
+    }
+
+    void ArmyManager::OnBarracksIdle(const Unit* unit)
+    {
+        Actions()->UnitCommand(unit, ABILITY_ID::TRAIN_MARINE);
+    }
+
+    void ArmyManager::OnMarineIdle(const Unit* unit)
+    {
+        /* too aggressive
+        const GameInfo& gameInfo = Observation()->GetGameInfo();
+        //What is attack_attack vs attack?
+        Actions()->UnitCommand(unit, ABILITY_ID::ATTACK_ATTACK, gameInfo.enemy_start_locations.front());
+        */
+    }
+
+    virtual void ArmyManager::OnUnitIdle(const Unit* unit)
+    {
+        switch (unit->unit_type.ToType()) {
+            case UNIT_TYPEID::TERRAN_BARRACKS:      OnBarracksIdle(unit);       break;
+            case UNIT_TYPEID::TERRAN_MARINE:        OnMarineIdle(unit);         break;
+            default:    break;
+        }
+    }
+};
+
 class Bot : public Agent {
 private:
     SupplyManager supplyManager;
     EconManager econManager;
+    ArmyManager armyManager;
 
     std::vector<ManagerBase*> managers;
 
@@ -497,11 +598,12 @@ public:
 
         supplyManager.Initialize(this);
         econManager.Initialize(this);
+        armyManager.Initialize(this);
 
         //Order added is order they'll get notifications and steps
         managers.push_back(&econManager);
         managers.push_back(&supplyManager);
-
+        managers.push_back(&armyManager);
     }
 
     //! Called when a game has ended.
@@ -612,7 +714,7 @@ int main(int argc, char* argv[])
     Bot bot;
     coordinator.SetParticipants({
         CreateParticipant(Race::Terran, &bot),
-        CreateComputer(Race::Zerg)
+        CreateComputer(Race::Terran)
     });
 
     //Slow down the damn game to a more normal speed
