@@ -3,6 +3,14 @@
 #include <iostream>
 using namespace sc2;
 
+
+//Through tutorial 3 plus some bonus events.  Beats the medium terran AI 80% of the time.
+
+//Main issues to work on:
+//  Multi-actions on a step.  If a barracks needs built, it will often build as many as it can.  Same with refineries and any other building.
+
+
+
 class Utils {
 public:
     //Get a random peon that is currently harvesting (not returning, not building, not moving somewhere on another mission, etc).
@@ -65,12 +73,19 @@ public:
         return observation->GetUnits(Unit::Alliance::Self, IsUnit(unitTypeID));
     }
 
-    static Units Utils::GetIdleUnits(const ObservationInterface* observation, UNIT_TYPEID unitTypeID)
+    static Units Utils::GetIdleUnits(const ObservationInterface* observation, UNIT_TYPEID unitTypeID, UNIT_TYPEID unitTypeID2)
     {
         //TODO:  Need to find some info on Filter, this should be simpler.
-        Units allUnits = observation->GetUnits(Unit::Alliance::Self, IsUnit(unitTypeID));
+        Units units1 = observation->GetUnits(Unit::Alliance::Self, IsUnit(unitTypeID));
+        Units units2 = observation->GetUnits(Unit::Alliance::Self, IsUnit(unitTypeID2));
+
         Units idleUnits;
-        for (const Unit* unit : allUnits) {
+        for (const Unit* unit : units1) {
+            if (unit->orders.size() == 0) {
+                idleUnits.push_back(unit);
+            }
+        }
+        for (const Unit* unit : units2) {
             if (unit->orders.size() == 0) {
                 idleUnits.push_back(unit);
             }
@@ -187,7 +202,7 @@ private:
             return 0;
         }
         
-        return (int32_t)ceil(extraNeeded / supplyDepotFood);
+        return (int32_t)ceil((double)extraNeeded / (double)supplyDepotFood);
     }
 
     int32_t SupplyManager::CalculateSupplyCurrentlyBeingProduced()
@@ -510,16 +525,19 @@ public:
         const ObservationInterface* observation = Observation();
 
         int32_t countBarracks = Utils::CountOwnUnits(observation, UNIT_TYPEID::TERRAN_BARRACKS);
+        int32_t currentSupply = observation->GetFoodUsed();
+        int32_t currentMinerals = observation->GetMinerals();
 
         //Build our first barracks at 16 and build one every time we hit 600 minerals in the bank after that.  Max at 10.
-        if (countBarracks == 0 && observation->GetFoodUsed() > 16) {
-            return true;
-        }
-        else if (countBarracks < 10 && observation->GetMinerals() >= 600) {
+        //Cap to no more than 1 per 15 food - we were getting hung up sometimes and building 9 rax at ~35 supply
+        if (countBarracks == 0 && currentSupply > 16) {
             return true;
         }
         else {
-            //That seems like enough barracks
+            int32_t maxDesiredRax = currentSupply / 15;
+            if (countBarracks < maxDesiredRax && currentMinerals >= 600) {
+                return true;
+            }
         }
 
         return false;
@@ -534,9 +552,9 @@ public:
     {
         const ObservationInterface* observation = Observation();
 
-        Units idleMarines = Utils::GetIdleUnits(observation, UNIT_TYPEID::TERRAN_MARINE);
-        if (idleMarines.size() > 15) {
-            LaunchAttackGroup(idleMarines);
+        Units idleArmy = Utils::GetIdleUnits(observation, UNIT_TYPEID::TERRAN_MARINE, UNIT_TYPEID::TERRAN_MARAUDER);
+        if (idleArmy.size() > 15) {
+            LaunchAttackGroup(idleArmy);
         }
     }
 
@@ -549,7 +567,38 @@ public:
 
     void ArmyManager::OnBarracksIdle(const Unit* unit)
     {
-        Actions()->UnitCommand(unit, ABILITY_ID::TRAIN_MARINE);
+        //0 = marine, 1 = marauder
+        unsigned int thingToBuild = 0;
+
+        //Got from examples:
+        //  https://github.com/Blizzard/s2client-api/blob/master/examples/common/bot_examples.cc
+        const Unit* raxAddOn = Observation()->GetUnit(unit->add_on_tag);
+        if (raxAddOn == nullptr) {
+            //Not upgraded, let's upgrade it 10% of the time.  Short circuit out if we do this.
+            if (rand() % 10 == 0) {
+                Actions()->UnitCommand(unit, ABILITY_ID::BUILD_TECHLAB);
+                return;
+            }
+
+            //Only marines
+            thingToBuild = 0;
+        }
+        else if (raxAddOn->unit_type == UNIT_TYPEID::TERRAN_BARRACKSREACTOR) {
+            //Marines only
+            thingToBuild = 0;
+        }
+        else if (raxAddOn->unit_type == UNIT_TYPEID::TERRAN_BARRACKSTECHLAB) {
+            thingToBuild = rand() % 2;
+        }
+
+        switch (thingToBuild) {
+        case 0:
+            Actions()->UnitCommand(unit, ABILITY_ID::TRAIN_MARINE);
+            break;
+        case 1:
+            Actions()->UnitCommand(unit, ABILITY_ID::TRAIN_MARAUDER);
+            break;
+        }
     }
 
     void ArmyManager::OnMarineIdle(const Unit* unit)
@@ -714,7 +763,7 @@ int main(int argc, char* argv[])
     Bot bot;
     coordinator.SetParticipants({
         CreateParticipant(Race::Terran, &bot),
-        CreateComputer(Race::Terran)
+        CreateComputer(Race::Terran, sc2::Medium)
     });
 
     //Slow down the damn game to a more normal speed
